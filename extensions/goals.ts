@@ -1,10 +1,8 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { nowIso, readJson, serializeError, writeJsonAtomic } from "./lib.ts";
+import { nowIso } from "./lib.ts";
 
 type GoalStatus = "active" | "done" | "dropped" | "blocked";
 type Priority = "low" | "medium" | "high";
@@ -32,19 +30,27 @@ interface GoalStore {
   goals: Goal[];
 }
 
-function storeFile(cwd: string): string {
-  return path.join(cwd, CONFIG_DIR_NAME, "goals.json");
+const ENTRY_TYPE = "pi-extended-goals";
+
+let store: GoalStore = { nextId: 1, goals: [] };
+
+function persist(pi: ExtensionAPI): void {
+  pi.appendEntry(ENTRY_TYPE, store);
 }
 
-function loadStore(cwd: string): GoalStore {
-  return readJson<GoalStore>(storeFile(cwd), { nextId: 1, goals: [] });
-}
-
-async function saveStore(cwd: string, store: GoalStore): Promise<void> {
+function restore(ctx: ExtensionContext): void {
+  store = { nextId: 1, goals: [] };
   try {
-    await writeJsonAtomic(storeFile(cwd), store);
-  } catch (err) {
-    throw new Error(`Failed to save ${storeFile(cwd)}: ${serializeError(err)}`);
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
+        const data = entry.data as GoalStore | undefined;
+        if (data && Array.isArray(data.goals) && typeof data.nextId === "number") {
+          store = { nextId: data.nextId, goals: data.goals };
+        }
+      }
+    }
+  } catch {
+    /* fresh session */
   }
 }
 
@@ -68,16 +74,16 @@ function statusWidget(goals: Goal[]): string[] {
   return lines;
 }
 
-function getGoal(store: GoalStore, id: number): Goal {
+function getGoal(id: number): Goal {
   const goal = store.goals.find((g) => g.id === id);
-  if (!goal) throw new Error(`Goal #${id} not found. Use goal_list.`);
+  if (!goal) throw new Error(`Goal #${id} not found in this session. Use goal_list.`);
   return goal;
 }
 
 export default function (pi: ExtensionAPI) {
-  const updateWidget = (ctx: { ui?: { setWidget?: (name: string, lines: string[]) => void } }, goals: Goal[]) => {
+  const updateWidget = (ctx: ExtensionContext) => {
     try {
-      ctx.ui?.setWidget?.("goals", statusWidget(goals));
+      ctx.ui?.setWidget?.("goals", statusWidget(store.goals));
     } catch {
       /* widget optional */
     }
@@ -87,9 +93,9 @@ export default function (pi: ExtensionAPI) {
     name: "goal_create",
     label: "Goal Create",
     description:
-      "Create a goal and persist it project-wide in .pi/goals.json so it survives across sessions. " +
-      "Use for multi-step objectives the user wants tracked; optionally link child goals with parent_id.",
-    promptSnippet: "Create a tracked goal (persisted in .pi/goals.json)",
+      "Create a goal tracked for the CURRENT SESSION (not persisted across sessions; /new starts a clean slate). " +
+      "Use for multi-step objectives within this conversation; optionally link child goals with parent_id.",
+    promptSnippet: "Create a session-scoped tracked goal",
     promptGuidelines: [
       "Use goal_create when the user defines an objective to track; keep goals updated with goal_update as work progresses and close them with goal_finish.",
     ],
@@ -101,7 +107,6 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-      const store = loadStore(ctx.cwd);
       if (params.parent_id && !store.goals.some((g) => g.id === params.parent_id)) {
         throw new Error(`Parent goal #${params.parent_id} not found.`);
       }
@@ -117,8 +122,8 @@ export default function (pi: ExtensionAPI) {
         updated_at: nowIso(),
       };
       store.goals.push(goal);
-      await saveStore(ctx.cwd, store);
-      updateWidget(ctx, store.goals);
+      persist(pi);
+      updateWidget(ctx);
       return {
         content: [{ type: "text", text: `Created goal #${goal.id}: ${goal.title}\n\n${formatGoal(goal)}` }],
         details: { goal },
@@ -130,7 +135,7 @@ export default function (pi: ExtensionAPI) {
     name: "goal_update",
     label: "Goal Update",
     description:
-      "Update a goal: change status (active/blocked/done/dropped), title, description, priority, or append a progress note.",
+      "Update a session goal: change status (active/blocked/done/dropped), title, description, priority, or append a progress note.",
     parameters: Type.Object({
       id: Type.Number({ description: "Goal id" }),
       status: Type.Optional(StringEnum(["active", "blocked", "done", "dropped"] as const)),
@@ -141,8 +146,7 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-      const store = loadStore(ctx.cwd);
-      const goal = getGoal(store, params.id);
+      const goal = getGoal(params.id);
       if (params.title !== undefined) goal.title = params.title;
       if (params.description !== undefined) goal.description = params.description;
       if (params.priority !== undefined) goal.priority = params.priority;
@@ -153,8 +157,8 @@ export default function (pi: ExtensionAPI) {
       }
       if (params.note) goal.notes.push({ ts: nowIso(), text: params.note });
       goal.updated_at = nowIso();
-      await saveStore(ctx.cwd, store);
-      updateWidget(ctx, store.goals);
+      persist(pi);
+      updateWidget(ctx);
       return {
         content: [{ type: "text", text: `Updated goal #${goal.id}.\n\n${formatGoal(goal)}` }],
         details: { goal },
@@ -165,15 +169,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "goal_finish",
     label: "Goal Finish",
-    description: "Mark a goal as done, optionally recording a completion summary note. Active child goals are closed too.",
+    description: "Mark a session goal as done, optionally recording a completion summary. Active child goals are closed too.",
     parameters: Type.Object({
       id: Type.Number({ description: "Goal id" }),
       summary: Type.Optional(Type.String({ description: "Completion summary appended as a note" })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-      const store = loadStore(ctx.cwd);
-      const goal = getGoal(store, params.id);
+      const goal = getGoal(params.id);
       goal.status = "done";
       goal.finished_at = nowIso();
       goal.updated_at = nowIso();
@@ -184,8 +187,8 @@ export default function (pi: ExtensionAPI) {
         child.finished_at = nowIso();
         child.updated_at = nowIso();
       }
-      await saveStore(ctx.cwd, store);
-      updateWidget(ctx, store.goals);
+      persist(pi);
+      updateWidget(ctx);
       const extra = children.length > 0 ? `\nAlso closed child goals: ${children.map((c) => `#${c.id}`).join(", ")}` : "";
       return {
         content: [{ type: "text", text: `Finished goal #${goal.id}: ${goal.title}${extra}\n\n${formatGoal(goal)}` }],
@@ -197,18 +200,17 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "goal_list",
     label: "Goal List",
-    description: "List tracked goals, optionally filtered by status.",
+    description: "List this session's goals, optionally filtered by status.",
     parameters: Type.Object({
       status: Type.Optional(StringEnum(["active", "blocked", "done", "dropped", "all"] as const, { description: "Default: all", default: "all" })),
     }),
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-      const store = loadStore(ctx.cwd);
+    async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
       const filter = params.status ?? "all";
       const goals = filter === "all" ? store.goals : store.goals.filter((g) => g.status === filter);
       if (goals.length === 0) {
         return {
-          content: [{ type: "text", text: `No ${filter === "all" ? "" : `${filter} `}goals in ${storeFile(ctx.cwd)}.` }],
+          content: [{ type: "text", text: `No ${filter === "all" ? "" : `${filter} `}goals in this session yet.` }],
           details: { goals: [] },
         };
       }
@@ -220,26 +222,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("goals", {
-    description: "Show tracked goals",
+    description: "Show this session's goals",
     getArgumentCompletions: (prefix: string) =>
       ["all", "active", "blocked", "done", "dropped"]
         .filter((s) => s.startsWith(prefix))
         .map((s) => ({ value: s, label: s })),
     handler: async (args, ctx) => {
       const status = (args || "all").trim() as GoalStatus | "all";
-      const store = loadStore(ctx.cwd);
       const goals = status === "all" ? store.goals : store.goals.filter((g) => g.status === status);
-      ctx.ui.notify(goals.length === 0 ? "No goals yet." : `Goals (${status}):\n\n${goals.map(formatGoal).join("\n\n")}`, "info");
+      ctx.ui.notify(goals.length === 0 ? "No goals in this session yet." : `Goals (${status}):\n\n${goals.map(formatGoal).join("\n\n")}`, "info");
     },
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    try {
-      if (!fs.existsSync(storeFile(ctx.cwd))) return;
-      const store = loadStore(ctx.cwd);
-      if (store.goals.length > 0) updateWidget(ctx, store.goals);
-    } catch {
-      /* ignore */
-    }
+    restore(ctx);
+    if (store.goals.length > 0) updateWidget(ctx);
   });
 }

@@ -28,7 +28,7 @@ Then `pi config` lets you toggle any extension off. Update with `pi update --ext
 | `write_stdin` | Send input to a running terminal (REPLs, debuggers, prompts) and get new output back. `press_enter: false` for raw control chars. |
 | `read_terminal` / `list_terminals` / `kill_terminal` | Poll output by offset, list all terminals, terminate. |
 | `view_image` | Attach a local image file or image URL to the conversation for vision models (png/jpeg/gif/webp/bmp, 15MB cap). |
-| `goal_create` / `goal_update` / `goal_finish` / `goal_list` | Persistent goals in `<project>/.pi/goals.json` — survive restarts, support priorities, notes, sub-goals (finish cascades to children). Live widget above the editor. |
+| `goal_create` / `goal_update` / `goal_finish` / `goal_list` | Session-scoped goals — stored in the session (clean slate on `/new`, restored on `/resume`, branch-correct under `/fork`). Priorities, notes, sub-goals (finish cascades to children). Live widget above the editor. |
 | `spawn_agent` | Named subagent = separate headless `pi` process with its own session, model, tools, cwd. Runs in background; session kept for follow-ups. |
 | `send_message` | Message an agent: queued if busy (delivered when current task ends), instant turn if idle. |
 | `followup_task` | Queue follow-up work without blocking. |
@@ -60,6 +60,7 @@ Zero npm runtime dependencies — everything is Node built-ins + fetch.
 - Background terminals and subagents are children of the pi process; they're terminated on
   `/new`, `/resume`, and quit. Agent *sessions* survive, so `spawn_agent` with the same name
   continues where it left off.
+- - Old `v0.1.0` project-persistent goals in `.pi/goals.json` are ignored by v0.1.2+; delete the file if you don't need it.
 - Agent state lives in `~/.pi/agent/pi-extended-agents.json`, agent sessions in
   `~/.pi/agent/pi-extended-agent-sessions/<name>/`.
 - Subagents don't see your conversation — pass complete, self-contained tasks. They run with the

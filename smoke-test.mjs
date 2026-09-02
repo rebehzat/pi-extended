@@ -76,7 +76,7 @@ const fin = await call(byName.goal_finish, { id: gid, summary: "done" });
 check("goal_finish cascades", fin.content[0].text.includes("Also closed child goals"));
 const list = await call(byName.goal_list, { status: "all" });
 check("goal_list", list.content[0].text.includes("Ship pi-extended"));
-check("goals.json persisted", fs.existsSync(path.join(tmp, ".pi", "goals.json")));
+check("goals session-scoped (no file written)", !fs.existsSync(path.join(tmp, ".pi", "goals.json")));
 
 // view_image: 1x1 png
 const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

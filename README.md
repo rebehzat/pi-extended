@@ -22,8 +22,8 @@ Then `pi config` lets you toggle any extension off. Update with `pi update --ext
 
 | Tool | What it does |
 |------|--------------|
-| `search` | Web search. DuckDuckGo first, **Tavily API backup** (set `TAVILY_API_KEY`). `engine: "tavily"` to force. |
-| `web_run` | One tool for the whole web: `search`, `open` (page → text + numbered links), `click` (follow link), `find` (regex within page), `image_search` (DDG/Tavily, optional inline download for VLMs), `pdf` (render pages to PNG + text via poppler), `weather` (wttr.in), `finance` (Yahoo quotes), `sports` (ESPN scoreboards/standings, 17 league presets), `time` (per-timezone). |
+| `search` | Web search with a 7-engine fallback chain: DuckDuckGo → Bing → Brave → Mojeek → SearXNG → **Tavily API** (`TAVILY_API_KEY`). First engine with results wins; `engine:` forces one. |
+| `web_run` | One tool for the whole web: `search`, `open` (page → text + numbered links), `click` (follow link), `find` (regex within page), `image_search` (DDG/Tavily, optional inline download for VLMs), `pdf` (render pages to PNG + text via poppler), `weather` (wttr.in), `finance` (Yahoo → Google Finance → CoinGecko fallbacks), `sports` (ESPN scoreboards/standings, 17 league presets), `time` (per-timezone). |
 | `spawn_terminal` | Long-running command in a background terminal (own bash process, stdin/stdout pipes). Returns a terminal id immediately. |
 | `write_stdin` | Send input to a running terminal (REPLs, debuggers, prompts) and get new output back. `press_enter: false` for raw control chars. |
 | `read_terminal` / `list_terminals` / `kill_terminal` | Poll output by offset, list all terminals, terminate. |

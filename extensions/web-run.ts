@@ -13,7 +13,7 @@ import {
   truncate,
   which,
 } from "./lib.ts";
-import { duckDuckGoSearch, formatResults, resolveTavilyKey, tavilySearch, type SearchResult } from "./web-search.ts";
+import { formatResults, resolveTavilyKey, searchWeb } from "./web-search.ts";
 
 interface Page {
   id: number;
@@ -375,21 +375,77 @@ async function doWeather(location: string, signal?: AbortSignal): Promise<string
   return lines.join("\n");
 }
 
-async function doFinance(symbols: string[], signal?: AbortSignal): Promise<string> {
-  const out: string[] = [];
-  for (const symbol of symbols.slice(0, 8)) {
-    const clean = symbol.trim().toUpperCase();
-    if (!clean) continue;
-    for (const host of ["query1", "query2"]) {
+const COINGECKO_IDS: Record<string, string> = {
+  BTC: "bitcoin",
+  ETH: "ethereum",
+  SOL: "solana",
+  XRP: "ripple",
+  ADA: "cardano",
+  DOGE: "dogecoin",
+  LTC: "litecoin",
+  BCH: "bitcoin-cash",
+  DOT: "polkadot",
+  LINK: "chainlink",
+  AVAX: "avalanche-2",
+  MATIC: "matic-network",
+  TRX: "tron",
+  XLM: "stellar",
+  XMR: "monero",
+  UNI: "uniswap",
+  ATOM: "cosmos",
+  NEAR: "near",
+  APT: "aptos",
+  ARB: "arbitrum",
+  OP: "optimism",
+  SHIB: "shiba-inu",
+  PEPE: "pepe",
+};
+
+const GOOGLE_FINANCE_EXCHANGES: Record<string, string> = {
+  AAPL: "NASDAQ",
+  MSFT: "NASDAQ",
+  GOOGL: "NASDAQ",
+  GOOG: "NASDAQ",
+  AMZN: "NASDAQ",
+  META: "NASDAQ",
+  NVDA: "NASDAQ",
+  TSLA: "NASDAQ",
+  AVGO: "NASDAQ",
+  AMD: "NASDAQ",
+  INTC: "NASDAQ",
+  NFLX: "NASDAQ",
+  ADBE: "NASDAQ",
+  QCOM: "NASDAQ",
+  "BRK-B": "NYSE",
+  JPM: "NYSE",
+  V: "NYSE",
+  KO: "NYSE",
+  DIS: "NYSE",
+  XOM: "NYSE",
+  WMT: "NYSE",
+  BA: "NYSE",
+  CAT: "NYSE",
+  GE: "NYSE",
+  IBM: "NYSE",
+  SPY: "NYSEARCA",
+  QQQ: "NASDAQ",
+};
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function yahooQuote(symbol: string, signal?: AbortSignal): Promise<string | null> {
+  for (const host of ["query1", "query2"]) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const res = await fetchWithTimeout(
-          `https://${host}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(clean)}?range=5d&interval=1d`,
-          { timeoutMs: 15000, signal, headers: { accept: "application/json" } },
+          `https://${host}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=5d&interval=1d`,
+          { timeoutMs: 15000, signal, headers: { accept: "application/json", "accept-language": "en-US,en;q=0.9" } },
         );
-        if (!res.ok) {
-          if (host === "query2") out.push(`${clean}: Yahoo HTTP ${res.status}`);
+        if (res.status === 429 && attempt === 0) {
+          await sleep(1500);
           continue;
         }
+        if (!res.ok) break;
         const data = (await res.json()) as {
           chart?: {
             result?: Array<{
@@ -410,33 +466,110 @@ async function doFinance(symbols: string[], signal?: AbortSignal): Promise<strin
           };
         };
         const meta = data.chart?.result?.[0]?.meta;
-        if (!meta?.regularMarketPrice) {
-          out.push(`${clean}: no quote data`);
-          break;
-        }
+        if (!meta?.regularMarketPrice) break;
         const prev = meta.chartPreviousClose ?? meta.previousClose;
         const change = prev ? meta.regularMarketPrice - prev : undefined;
         const pct = prev && change !== undefined ? (change / prev) * 100 : undefined;
-        out.push(
+        return [
+          `${symbol}${meta.longName ? ` (${meta.longName})` : ""} [${meta.exchangeName ?? "yahoo"}]`,
+          `  ${meta.regularMarketPrice} ${meta.currency ?? ""} ${change !== undefined ? `| chg ${change >= 0 ? "+" : ""}${change.toFixed(2)}${pct !== undefined ? ` (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)` : ""}` : ""}`,
           [
-            `${clean}${meta.longName ? ` (${meta.longName})` : ""} [${meta.exchangeName ?? ""}]`,
-            `  ${meta.regularMarketPrice} ${meta.currency ?? ""} ${change !== undefined ? `| chg ${change >= 0 ? "+" : ""}${change.toFixed(2)}${pct !== undefined ? ` (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)` : ""}` : ""}`,
-            [
-              meta.regularMarketDayLow !== undefined ? `day L/H ${meta.regularMarketDayLow}/${meta.regularMarketDayHigh}` : "",
-              meta.fiftyTwoWeekLow !== undefined ? `52w L/H ${meta.fiftyTwoWeekLow}/${meta.fiftyTwoWeekHigh}` : "",
-              meta.regularMarketVolume !== undefined ? `vol ${meta.regularMarketVolume.toLocaleString()}` : "",
-            ]
-              .filter(Boolean)
-              .join(" | "),
-          ].join("\n"),
-        );
+            meta.regularMarketDayLow !== undefined ? `day L/H ${meta.regularMarketDayLow}/${meta.regularMarketDayHigh}` : "",
+            meta.fiftyTwoWeekLow !== undefined ? `52w L/H ${meta.fiftyTwoWeekLow}/${meta.fiftyTwoWeekHigh}` : "",
+            meta.regularMarketVolume !== undefined ? `vol ${meta.regularMarketVolume.toLocaleString()}` : "",
+          ]
+            .filter(Boolean)
+            .join(" | "),
+        ].join("\n");
+      } catch {
         break;
-      } catch (err) {
-        if (host === "query2") out.push(`${clean}: ${serializeError(err)}`);
       }
     }
   }
-  return out.length > 0 ? out.join("\n\n") : "No symbols provided.";
+  return null;
+}
+
+async function googleFinanceQuote(symbol: string, signal?: AbortSignal): Promise<string | null> {
+  const target = symbol.includes(":") ? symbol : GOOGLE_FINANCE_EXCHANGES[symbol];
+  if (!target) return null;
+  const gfSymbol = target.includes(":") ? target : `${symbol}:${target}`;
+  try {
+    const res = await fetchWithTimeout(`https://www.google.com/finance/quote/${encodeURIComponent(gfSymbol)}`, {
+      timeoutMs: 15000,
+      signal,
+      redirect: "follow",
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const price = html.match(/data-last-price="([0-9.,]+)"/)?.[1];
+    if (!price) return null;
+    const currency = html.match(/data-currency-code="([A-Z]{3})"/)?.[1] ?? "";
+    const prevClose = html.match(/Previous close[\s\S]{0,250}?([0-9]+(?:\.[0-9]+)?)</i)?.[1];
+    const p = Number.parseFloat(price.replace(/,/g, ""));
+    const prev = prevClose ? Number.parseFloat(prevClose) : undefined;
+    const change = prev ? p - prev : undefined;
+    const pct = prev ? (change! / prev) * 100 : undefined;
+    return [
+      `${symbol} [google: ${gfSymbol}]`,
+      `  ${p} ${currency} ${change !== undefined ? `| chg ${change >= 0 ? "+" : ""}${change.toFixed(2)}${pct !== undefined ? ` (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)` : ""}` : ""}`,
+    ].join("\n");
+  } catch {
+    return null;
+  }
+}
+
+async function coinGeckoQuote(symbol: string, signal?: AbortSignal): Promise<string | null> {
+  const base = symbol.replace(/-USD$/i, "").toUpperCase();
+  const id = COINGECKO_IDS[base];
+  if (!id) return null;
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd&include_24hr_change=true`,
+      { timeoutMs: 15000, signal, headers: { accept: "application/json" } },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, { usd?: number; usd_24h_change?: number }>;
+    const entry = data[id];
+    if (!entry?.usd) return null;
+    const chg = entry.usd_24h_change;
+    return [
+      `${base}-USD [coingecko]`,
+      `  $${entry.usd} ${chg !== undefined ? `| 24h ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%` : ""}`,
+    ].join("\n");
+  } catch {
+    return null;
+  }
+}
+
+async function doFinance(symbols: string[], signal?: AbortSignal): Promise<string> {
+  const out: string[] = [];
+  const failures: string[] = [];
+  for (const symbol of symbols.slice(0, 8)) {
+    const clean = symbol.trim().toUpperCase();
+    if (!clean) continue;
+    const yahoo = await yahooQuote(clean, signal);
+    if (yahoo) {
+      out.push(yahoo);
+      continue;
+    }
+    const gf = await googleFinanceQuote(clean, signal);
+    if (gf) {
+      out.push(gf);
+      continue;
+    }
+    const cg = await coinGeckoQuote(clean, signal);
+    if (cg) {
+      out.push(cg);
+      continue;
+    }
+    failures.push(clean);
+  }
+  const lines = out.length > 0 ? out.join("\n\n") : "";
+  const warn =
+    failures.length > 0
+      ? `${lines ? "\n\n" : ""}No quote data for: ${failures.join(", ")} (Yahoo rate-limited this IP; Google Finance/CoinGecko had no match). Try again in a moment or use an explicit exchange like AAPL:NASDAQ.`
+      : "";
+  return (lines + warn).trim() || "No symbols provided.";
 }
 
 function formatTimeZone(zone: string): string {
@@ -614,14 +747,17 @@ export default function (pi: ExtensionAPI) {
       switch (params.action) {
         case "search": {
           if (!params.query) throw new Error("search requires `query`.");
-          const cap = 8;
-          let results: SearchResult[] = await duckDuckGoSearch(params.query, cap).catch(() => []);
-          if (results.length === 0) {
-            const key = resolveTavilyKey();
-            if (key) results = await tavilySearch(params.query, cap, key).catch(() => []);
+          const outcome = await searchWeb(params.query, 8);
+          if (outcome.results.length === 0) {
+            out = textOut(
+              `No results for "${params.query}"${outcome.errors.length > 0 ? ` (tried: ${outcome.errors.join("; ")})` : ""}`,
+            );
+          } else {
+            out = textOut(
+              `Search results for "${params.query}" via ${outcome.engine}:\n\n${formatResults(outcome.results)}`,
+              { query: params.query, engine: outcome.engine, count: outcome.results.length },
+            );
           }
-          if (results.length === 0) out = textOut(`No results for "${params.query}".`);
-          else out = textOut(`Search results for "${params.query}":\n\n${formatResults(results)}`, { query: params.query, count: results.length });
           break;
         }
 

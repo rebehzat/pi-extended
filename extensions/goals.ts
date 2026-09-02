@@ -236,6 +236,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     restore(ctx);
-    if (store.goals.length > 0) updateWidget(ctx);
+    try {
+      ctx.ui?.setWidget?.("goals", store.goals.length > 0 ? statusWidget(store.goals) : []);
+    } catch {
+      /* widget optional */
+    }
   });
 }

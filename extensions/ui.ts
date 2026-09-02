@@ -34,12 +34,15 @@ function runningAgents(): number {
   }
 }
 
-function activeGoals(cwd: string): number {
+function activeGoals(ctx: ExtensionContext): number {
   try {
-    const goalFile = path.join(cwd, ".pi", "goals.json");
-    if (!fs.existsSync(goalFile)) return 0;
-    const store = JSON.parse(fs.readFileSync(goalFile, "utf8")) as { goals?: Array<{ status?: string }> };
-    return (store.goals ?? []).filter((g) => g.status === "active").length;
+    let latest: { goals?: Array<{ status?: string }> } | undefined;
+    for (const e of ctx.sessionManager.getEntries()) {
+      if (e.type === "custom" && e.customType === "pi-extended-goals") {
+        latest = e.data as { goals?: Array<{ status?: string }> };
+      }
+    }
+    return (latest?.goals ?? []).filter((g) => g.status === "active").length;
   } catch {
     return 0;
   }
@@ -83,7 +86,7 @@ export default function (pi: ExtensionAPI) {
             const extras: string[] = [];
             const agents = runningAgents();
             if (agents > 0) extras.push(`${theme.fg("warning", "⧗")} ${agents} agent${agents > 1 ? "s" : ""}`);
-            const goals = activeGoals(ctx.cwd);
+            const goals = activeGoals(ctx);
             if (goals > 0) extras.push(`${theme.fg("success", "◎")} ${goals} goal${goals > 1 ? "s" : ""}`);
 
             const left = [

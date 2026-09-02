@@ -548,6 +548,11 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.on("session_start", async () => {
+    const state = loadState();
+    await saveState(state);
+  });
+
   pi.on("session_shutdown", async () => {
     for (const [, turn] of running) {
       try {

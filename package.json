@@ -1,6 +1,6 @@
 {
   "name": "pi-extended",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "pi package: search (DuckDuckGo + Tavily), background terminals with write_stdin, view_image, web_run (pages/PDF/images/weather/finance/sports/time), goals, and session-persistent subagents",
   "type": "module",
   "keywords": [

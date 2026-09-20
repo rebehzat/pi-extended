@@ -18,6 +18,11 @@ pi install /path/to/this/repo                         # local checkout
 
 Then `pi config` lets you toggle any extension off. Update with `pi update --extensions`.
 
+Inside Pi, run `/tinyfish-key` and paste the key from `agent.tinyfish.ai`. Pi stores it in
+`~/.pi/agent/tinyfish.json` with owner-only permissions. Use `/tinyfish-key status` to check it
+or `/tinyfish-key clear` to remove it. The `TINYFISH_API_KEY` environment variable is supported
+as an explicit override for CI and one-off runs.
+
 ## Tools
 
 | Tool | What it does |

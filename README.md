@@ -1,7 +1,7 @@
 # pi-extended
 
 A [pi](https://github.com/earendil-works/pi) package that turns the minimal coding harness into a
-fully-loaded agent: web search with fallback, background terminals, image viewing, an all-in-one
+fully-loaded agent: TinyFish web search, background terminals, image viewing, an all-in-one
 `web_run` tool, persistent goals, and named subagents you can message.
 
 Built entirely as extensions — **pi itself stays stock**, so `pi update` / `pi update --self`
@@ -22,8 +22,8 @@ Then `pi config` lets you toggle any extension off. Update with `pi update --ext
 
 | Tool | What it does |
 |------|--------------|
-| `search` | Web search with a 7-engine fallback chain: DuckDuckGo → Bing → Brave → Mojeek → SearXNG → **Tavily API** (`TAVILY_API_KEY`). First engine with results wins; `engine:` forces one. |
-| `web_run` | One tool for the whole web: `search`, `open` (page → text + numbered links), `click` (follow link), `find` (regex within page), `image_search` (DDG/Tavily, optional inline download for VLMs), `pdf` (render pages to PNG + text via poppler), `weather` (wttr.in), `finance` (Yahoo → Google Finance → CoinGecko fallbacks), `sports` (ESPN scoreboards/standings, 17 league presets), `time` (per-timezone). |
+| `search` | Live structured web search through TinyFish (`TINYFISH_API_KEY` or the Pi-managed key). |
+| `web_run` | One tool for the whole web: `search`, `open` (page → text + numbered links), `click` (follow link), `find` (regex within page), `image_search` (DuckDuckGo, optional inline download for VLMs), `pdf` (render pages to PNG + text via poppler), `weather` (wttr.in), `finance` (Yahoo → Google Finance → CoinGecko fallbacks), `sports` (ESPN scoreboards/standings, 17 league presets), `time` (per-timezone). |
 | `spawn_terminal` | Long-running command in a background terminal (own bash process, stdin/stdout pipes). Returns a terminal id immediately. |
 | `write_stdin` | Send input to a running terminal (REPLs, debuggers, prompts) and get new output back. `press_enter: false` for raw control chars. |
 | `read_terminal` / `list_terminals` / `kill_terminal` | Poll output by offset, list all terminals, terminate. |
@@ -50,7 +50,7 @@ Then `pi config` lets you toggle any extension off. Update with `pi update --ext
 
 | Thing | Needed for | Fallback without it |
 |-------|-----------|--------------------|
-| `TAVILY_API_KEY` | Tavily search/image backup | DuckDuckGo only |
+| `TINYFISH_API_KEY` | Optional environment override for TinyFish search (interactive users should run `/tinyfish-key` in Pi) | Search reports that the key is not configured |
 | `poppler-utils` (`sudo apt install poppler-utils`) | `web_run pdf` page rendering | error message suggesting install |
 
 Zero npm runtime dependencies — everything is Node built-ins + fetch.
@@ -79,7 +79,7 @@ node smoke-test.mjs  # loads every extension via jiti + exercises tools end-to-e
 ```
 extensions/
 ├── lib.ts          # shared utils (not an extension)
-├── web-search.ts   # search (DDG + Tavily)
+├── web-search.ts   # TinyFish search + /tinyfish-key setup
 ├── web-run.ts      # web_run composite tool
 ├── terminals.ts    # background terminals + write_stdin
 ├── view-image.ts   # view_image for VLMs

@@ -103,12 +103,13 @@ try {
   check("web_run finance", false, String(e).slice(0, 100));
 }
 
-// search (network)
+// search (network, requires TINYFISH_API_KEY or the Pi-managed key)
 try {
   const s = await call(byName.search, { query: "pi coding agent earendil-works", max_results: 3 });
-  check("search duckduckgo/tavily", /results for/.test(s.content[0].text), s.content[0].text.split("\n")[0]);
+  const configured = Boolean(process.env.TINYFISH_API_KEY);
+  check("search TinyFish", configured ? /results for/.test(s.content[0].text) : /No results|results for/.test(s.content[0].text), s.content[0].text.split("\n")[0]);
 } catch (e) {
-  check("search duckduckgo/tavily", false, String(e).slice(0, 100));
+  check("search TinyFish", false, String(e).slice(0, 100));
 }
 
 // web_run open (network)

@@ -13,7 +13,7 @@ import {
   truncate,
   which,
 } from "./lib.ts";
-import { formatResults, resolveTavilyKey, searchWeb } from "./web-search.ts";
+import { formatResults, searchWeb } from "./web-search.ts";
 
 interface Page {
   id: number;
@@ -127,30 +127,6 @@ async function doImageSearch(
   const images: { title: string; image_url: string; source: string; width?: number; height?: number }[] = [];
   const errors: string[] = [];
 
-  const tavilyKey = resolveTavilyKey();
-  if (tavilyKey) {
-    try {
-      const res = await fetchWithTimeout("https://api.tavily.com/search", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ api_key: tavilyKey, query, max_results: 10, include_images: true, search_depth: "basic" }),
-        timeoutMs: 20000,
-        signal,
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { images?: Array<string | { url?: string }> };
-        for (const img of data.images ?? []) {
-          const u = typeof img === "string" ? img : img.url;
-          if (u) images.push({ title: query, image_url: u, source: "tavily" });
-        }
-      } else {
-        errors.push(`tavily HTTP ${res.status}`);
-      }
-    } catch (err) {
-      errors.push(`tavily: ${serializeError(err)}`);
-    }
-  }
-
   if (images.length === 0) {
     try {
       const tokenRes = await fetchWithTimeout(
@@ -184,7 +160,7 @@ async function doImageSearch(
 
   if (images.length === 0) {
     return textOut(
-      `No image results for "${query}"${errors.length ? ` (${errors.join("; ")})` : ""}. Set TAVILY_API_KEY for better coverage.`,
+      `No image results for "${query}"${errors.length ? ` (${errors.join("; ")})` : ""}.`,
     );
   }
 

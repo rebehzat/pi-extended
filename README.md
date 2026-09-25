@@ -46,8 +46,12 @@ as an explicit override for CI and one-off runs.
 
 ## UI polish (`ui.ts`)
 
-- Custom footer: session tokens ↑↓, cost, git branch, model, running subagents, active goals
-- Rainbow spinner while the agent works, turn counter in the status line
+- Custom footer:
+  - line 1: git branch, working directory, session name, and a **context bar** (`ctx ▰▰▰▱▱▱▱▱▱▱ 31% 84k/272k`, green → yellow over 70% → red over 90%)
+  - line 2: session tokens ↑↓, cache reads and hit rate, cost, running subagents, active goals, turns, session time; model and thinking level (in the thinking colour) on the right
+  - line 3: statuses from other extensions (HARDcode, SoftCode, ultracode, …)
+  - it follows `/new`, `/resume` and forks, and shortens to fit narrow terminals
+- Rainbow spinner while the agent works
 - Model change notifications
 - Widgets: active goals (from `goals.ts`)
 

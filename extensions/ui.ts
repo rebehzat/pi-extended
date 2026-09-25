@@ -100,7 +100,17 @@ export default function (pi: ExtensionAPI) {
               .join(theme.fg("dim", " │ "));
 
             const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right) - 2));
-            return [truncateToWidth(` ${left}${pad}${right} `, width)];
+            const lines = [truncateToWidth(` ${left}${pad}${right} `, width)];
+
+            // Statuses other extensions publish via ctx.ui.setStatus(), sorted by key like the built-in footer.
+            const statuses = [...footerData.getExtensionStatuses().entries()]
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([, text]) => text.replace(/[\r\n\t]+/g, " ").trim())
+              .filter(Boolean);
+            if (statuses.length > 0) {
+              lines.push(truncateToWidth(` ${statuses.join(theme.fg("dim", " │ "))}`, width, theme.fg("dim", "…")));
+            }
+            return lines;
           },
         };
       });

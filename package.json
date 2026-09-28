@@ -10,7 +10,8 @@
   "pi": {
     "extensions": [
       "extensions/*.ts",
-      "!extensions/lib.ts"
+      "!extensions/lib.ts",
+      "!extensions/usage.ts"
     ]
   },
   "peerDependencies": {

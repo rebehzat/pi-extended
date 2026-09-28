@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { collectUsage, hasPendingRunScan } from "./usage.ts";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const RAINBOW = [
@@ -93,34 +93,37 @@ export default function (pi: ExtensionAPI) {
   // The footer reads the current session through this, so it follows /new, /resume and forks.
   let ctxRef: ExtensionContext | undefined;
   let requestRender: (() => void) | undefined;
+  let cachedStats: ReturnType<typeof computeSessionStats> | undefined;
+  let cachedSession = "";
+  let cachedEntries = 0;
+  let statsDirty = true;
+  let agentsWereRunning = false;
 
-  const sessionStats = (ctx: ExtensionContext) => {
-    const t = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cacheHit: undefined as number | undefined, started: undefined as number | undefined };
-    const add = (u: any) => {
-      if (!u) return;
-      t.input += u.input ?? 0;
-      t.output += u.output ?? 0;
-      t.cacheRead += u.cacheRead ?? 0;
-      t.cacheWrite += u.cacheWrite ?? 0;
-      t.cost += u.cost?.total ?? 0;
-    };
-    try {
-      // All entries, like pi's own footer: usage from compactions and abandoned branches still cost money.
-      for (const e of ctx.sessionManager.getEntries() as any[]) {
-        if (t.started === undefined && e.timestamp) t.started = Date.parse(e.timestamp);
-        if (e.type === "usage") add(e.usage);
-        else if (e.type === "message" && e.message.role === "assistant") {
-          const u = (e.message as AssistantMessage).usage;
-          add(u);
-          const prompt = u.input + u.cacheRead + u.cacheWrite;
-          t.cacheHit = prompt > 0 ? (u.cacheRead / prompt) * 100 : undefined;
-        } else if (e.type === "message" && e.message.role === "toolResult" && e.message.usage) add(e.message.usage);
-        else if ((e.type === "branch_summary" || e.type === "compaction") && e.usage) add(e.usage);
+  const computeSessionStats = (ctx: ExtensionContext) => {
+    const t = { ...collectUsage(ctx).total, cacheHit: undefined as number | undefined, started: undefined as number | undefined };
+    // Keep the existing context cache-hit display and elapsed-session clock parent-only.
+    for (const e of ctx.sessionManager.getEntries()) {
+      if (t.started === undefined && e.timestamp) t.started = Date.parse(e.timestamp);
+      if (e.type === "message" && e.message.role === "assistant") {
+        const u = e.message.usage;
+        const prompt = u.input + u.cacheRead + u.cacheWrite;
+        t.cacheHit = prompt > 0 ? (u.cacheRead / prompt) * 100 : undefined;
       }
-    } catch {
-      /* no session data yet */
     }
     return t;
+  };
+
+  const sessionStats = (ctx: ExtensionContext, activeAgents: number) => {
+    const id = ctx.sessionManager.getSessionId();
+    const length = ctx.sessionManager.getEntries().length;
+    if (statsDirty || !cachedStats || id !== cachedSession || length !== cachedEntries || activeAgents > 0 || agentsWereRunning) {
+      cachedStats = computeSessionStats(ctx);
+      cachedSession = id;
+      cachedEntries = length;
+      statsDirty = false;
+    }
+    agentsWereRunning = activeAgents > 0;
+    return cachedStats;
   };
 
   const installFooter = (ctx: ExtensionContext) => {
@@ -131,18 +134,30 @@ export default function (pi: ExtensionAPI) {
         // Keep the session clock ticking while idle.
         const timer = setInterval(() => tui.requestRender(), 30_000);
         timer.unref?.();
+        let scanTimer: ReturnType<typeof setTimeout> | undefined;
         const sep = theme.fg("dim", " │ ");
         const ellipsis = theme.fg("dim", "…");
         return {
           dispose() {
             unsub();
             clearInterval(timer);
+            if (scanTimer) clearTimeout(scanTimer);
             requestRender = undefined;
           },
           invalidate() {},
           render(width: number): string[] {
             const c = ctxRef ?? ctx;
-            const st = sessionStats(c);
+            const agents = runningAgents();
+            const st = sessionStats(c, agents);
+            // Finish historical discovery in bounded batches, then stop all idle accounting IO.
+            if (hasPendingRunScan() && !scanTimer) {
+              scanTimer = setTimeout(() => {
+                scanTimer = undefined;
+                statsDirty = true;
+                tui.requestRender();
+              }, 25);
+              scanTimer.unref?.();
+            }
 
             // Line 1: where we are, and how full the context is.
             // Branch first, so a long path gets shortened instead of hiding it.
@@ -179,7 +194,6 @@ export default function (pi: ExtensionAPI) {
               if (st.cacheHit !== undefined) tokens.push(`${st.cacheHit.toFixed(0)}% hit`);
             }
             const left = [theme.fg("dim", tokens.join(" ")), theme.fg("dim", `$${st.cost.toFixed(3)}`)];
-            const agents = runningAgents();
             if (agents > 0) left.push(`${theme.fg("warning", "⧗")} ${agents} agent${agents > 1 ? "s" : ""}`);
             const goals = activeGoals(c);
             if (goals > 0) left.push(`${theme.fg("success", "◎")} ${goals} goal${goals > 1 ? "s" : ""}`);
@@ -217,6 +231,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     turnCount = 0;
+    statsDirty = true;
     ctxRef = ctx;
     if (!footerEnabled) {
       footerEnabled = true;
@@ -270,6 +285,7 @@ export default function (pi: ExtensionAPI) {
     } catch {
       /* ignore */
     }
+    statsDirty = true;
     requestRender?.();
   });
 

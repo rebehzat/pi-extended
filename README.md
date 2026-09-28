@@ -48,7 +48,7 @@ as an explicit override for CI and one-off runs.
 
 - Custom footer:
   - line 1: git branch, working directory, session name, and a **context bar** (`ctx ▰▰▰▱▱▱▱▱▱▱ 31% 84k/272k`, green → yellow over 70% → red over 90%)
-  - line 2: session tokens ↑↓, cache reads and hit rate, cost, running subagents, active goals, turns, session time; model and thinking level (in the thinking colour) on the right
+  - line 2: billed session **plus linked subagent/workflow** tokens ↑↓, cache reads and hit rate, combined cost, running subagents, active goals, turns, session time; model and thinking level (in the thinking colour) on the right
   - line 3: statuses from other extensions (HARDcode, SoftCode, ultracode, …)
   - it follows `/new`, `/resume` and forks, and shortens to fit narrow terminals
 - Rainbow spinner while the agent works
@@ -71,7 +71,8 @@ Zero npm runtime dependencies — everything is Node built-ins + fetch.
   continues where it left off.
 - - Old `v0.1.0` project-persistent goals in `.pi/goals.json` are ignored by v0.1.2+; delete the file if you don't need it.
 - Agent state lives in `~/.pi/agent/pi-extended-agents.json`, agent sessions in
-  `~/.pi/agent/pi-extended-agent-sessions/<name>/`.
+  `~/.pi/agent/pi-extended-agent-sessions/<name>/`. New turns also save parent-session attribution windows there so reusing a named agent in another session does not transfer its charges. Historical turns without a matching session-owned accounting window have unknown ownership and are excluded from billed totals, not assigned by agent name.
+- The footer bills persisted Pi session entries (all branches), not streaming agent summaries, workflow results, or replayed workflow journals. It also reads linked workflow child sessions under `~/.pi/agent/ultracode/runs/<id>/agents/`; a workflow attempt whose session directory was deleted on retry cannot be recovered. Parent tool results that already report usage are not billed again from the linked child.
 - Subagents don't see your conversation — pass complete, self-contained tasks. They run with the
   same model unless `model`/`thinking` overrides are given, and can be restricted with `tools`.
 
@@ -79,8 +80,9 @@ Zero npm runtime dependencies — everything is Node built-ins + fetch.
 
 ```bash
 npm install
-npx tsc --noEmit     # typecheck against real pi types
-node smoke-test.mjs  # loads every extension via jiti + exercises tools end-to-end
+npx tsc --noEmit        # typecheck against real pi types
+node --test usage-test.mjs # offline session-accounting fixtures
+node smoke-test.mjs     # loads every extension via jiti + exercises tools end-to-end
 ```
 
 ## Layout
@@ -88,6 +90,7 @@ node smoke-test.mjs  # loads every extension via jiti + exercises tools end-to-e
 ```
 extensions/
 ├── lib.ts          # shared utils (not an extension)
+├── usage.ts        # session and child accounting (not an extension)
 ├── web-search.ts   # TinyFish search + /tinyfish-key setup
 ├── web-run.ts      # web_run composite tool
 ├── terminals.ts    # background terminals + write_stdin

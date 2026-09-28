@@ -21,7 +21,8 @@ const mockPi = {
 };
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piext-smoke-"));
-const mockCtx = { cwd: tmp, ui: { setWidget: () => {}, notify: () => {} }, model: undefined, thinkingLevel: undefined };
+const mockCtx = { cwd: tmp, ui: { setWidget: () => {}, notify: () => {} }, model: undefined, thinkingLevel: undefined,
+  sessionManager: { getSessionId: () => "smoke-parent" } };
 const noop = () => {};
 const abort = undefined;
 

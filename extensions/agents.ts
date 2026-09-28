@@ -21,9 +21,11 @@ interface AgentRecord {
   lastOutput?: string;
   lastExitCode?: number | null;
   status: AgentStatus;
-  queue: string[];
+  queue: Array<string | { task: string; sessionId: string; toolCallId?: string }>;
   turnCount: number;
   usage: { turns: number; input: number; output: number; cost: number };
+  // Attribution windows for persisted child session entries, not extra charges.
+  accounting?: Array<{ sessionId: string; startedAt: string; endedAt?: string; toolCallId?: string }>;
 }
 
 interface AgentState {
@@ -52,11 +54,24 @@ function sessionsRoot(): string {
 
 function loadState(): AgentState {
   const state = readJson<AgentState>(stateFile(), { agents: {} });
+  let recovered = false;
+  const closedAt = nowIso();
   for (const rec of Object.values(state.agents)) {
     if (rec.status === "running" && !running.has(rec.name)) {
       rec.status = "error";
       rec.lastOutput = rec.lastOutput ?? "(pi restarted while agent was running; turn lost)";
+      // A crash cannot leave the previous parent's billing window open for a later turn.
+      for (const window of rec.accounting ?? []) {
+        if (!window.endedAt) window.endedAt = closedAt;
+      }
+      recovered = true;
     }
+  }
+  if (recovered) {
+    const file = stateFile();
+    const tmp = `${file}.${process.pid}.recovery.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, file);
   }
   return state;
 }
@@ -263,11 +278,26 @@ export default function (pi: ExtensionAPI) {
     record.status = isTurnOk(turn) ? "idle" : "error";
   };
 
+  const accountedTurn = async (record: AgentRecord, task: string, isContinue: boolean, sessionId?: string, toolCallId?: string, signal?: AbortSignal, onUpdate?: UpdateFn): Promise<TurnResult> => {
+    const window = sessionId ? { sessionId, toolCallId, startedAt: nowIso(), endedAt: undefined as string | undefined } : undefined;
+    if (window) {
+      (record.accounting ??= []).push(window);
+      await persist(record);
+    }
+    try { return await runTurn(record, task, isContinue, signal, onUpdate); }
+    finally {
+      if (window) {
+        window.endedAt = nowIso();
+        await persist(record);
+      }
+    }
+  };
+
   const kickQueue = async (record: AgentRecord, signal?: AbortSignal): Promise<void> => {
     while (record.queue.length > 0 && !running.has(record.name)) {
       const next = record.queue.shift()!;
       record.turnCount++;
-      const turn = await runTurn(record, next, true, signal);
+      const turn = await accountedTurn(record, typeof next === "string" ? next : next.task, true, typeof next === "string" ? undefined : next.sessionId, typeof next === "string" ? undefined : next.toolCallId, signal);
       applyTurnResult(record, turn);
     }
     await persist(record);
@@ -276,11 +306,14 @@ export default function (pi: ExtensionAPI) {
   const startAgent = async (
     record: AgentRecord,
     prompt: string,
+    sessionId: string,
+    toolCallId: string,
+    isContinue: boolean,
     signal?: AbortSignal,
     onUpdate?: UpdateFn,
   ): Promise<void> => {
-    record.turnCount = 1;
-    const turn = await runTurn(record, prompt, false, signal, onUpdate);
+    record.turnCount = isContinue ? record.turnCount + 1 : 1;
+    const turn = await accountedTurn(record, prompt, isContinue, sessionId, toolCallId, signal, onUpdate);
     applyTurnResult(record, turn);
     await kickQueue(record, signal);
   };
@@ -306,7 +339,7 @@ export default function (pi: ExtensionAPI) {
       cwd: Type.Optional(Type.String({ description: "Working directory for the agent (default: current dir)" })),
     }),
 
-    async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<unknown>> {
+    async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       const name = params.name.trim();
       if (!validName(name)) {
         throw new Error("Invalid agent name: use 1-32 chars of letters, digits, '-', '_'.");
@@ -345,7 +378,7 @@ export default function (pi: ExtensionAPI) {
       state.agents[name] = record;
       await saveState(state);
 
-      void startAgent(record, params.task, signal, onUpdate).catch((err) => {
+      void startAgent(record, params.task, ctx.sessionManager.getSessionId(), toolCallId, Boolean(existing), signal, onUpdate).catch((err) => {
         record.status = "error";
         record.lastOutput = serializeError(err);
         record.lastActivity = nowIso();
@@ -374,7 +407,7 @@ export default function (pi: ExtensionAPI) {
       message: Type.String({ description: "Message/instruction for the agent" }),
     }),
 
-    async execute(_toolCallId, params, signal, onUpdate, _ctx): Promise<AgentToolResult<unknown>> {
+    async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       const state = loadState();
       const record = state.agents[params.agent];
       if (!record) {
@@ -382,7 +415,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Unknown agent "${params.agent}". Known: ${available}.`);
       }
       if (running.has(record.name) || record.status === "running") {
-        record.queue.push(params.message);
+        record.queue.push({ task: params.message, sessionId: ctx.sessionManager.getSessionId(), toolCallId });
         await persist(record);
         return {
           content: [
@@ -395,7 +428,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       record.turnCount++;
-      const turn = await runTurn(record, params.message, true, signal, onUpdate);
+      const turn = await accountedTurn(record, params.message, true, ctx.sessionManager.getSessionId(), toolCallId, signal, onUpdate);
       applyTurnResult(record, turn);
       void kickQueue(record, signal).catch(() => {});
       await persist(record);
@@ -416,14 +449,14 @@ export default function (pi: ExtensionAPI) {
       task: Type.String({ description: "Follow-up task" }),
     }),
 
-    async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
+    async execute(toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
       const state = loadState();
       const record = state.agents[params.agent];
       if (!record) {
         const available = Object.keys(state.agents).join(", ") || "none";
         throw new Error(`Unknown agent "${params.agent}". Known: ${available}.`);
       }
-      record.queue.push(params.task);
+      record.queue.push({ task: params.task, sessionId: ctx.sessionManager.getSessionId(), toolCallId });
       await persist(record);
       if (!running.has(record.name) && record.status !== "running") {
         void kickQueue(record).catch(() => {});

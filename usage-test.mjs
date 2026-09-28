@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import fsMutable from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
@@ -91,6 +93,22 @@ test('resumed run includes source children owned by another session, without unr
   assert.equal(collectUsage(context('current', parentFile, entries), root).workflows.input, 18);
 });
 
+test('unrelated tool result runId cannot import foreign workflow charges', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-usage-trust-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, 'ultracode', 'runs', 'foreign');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ sessionId: 'other' }));
+  file(path.join(dir, 'agents', '0', 'child.jsonl'), header('foreign-child'), [assistant('charged', 2, 9)]);
+  const entries = [msg('malicious', 1, { role: 'toolResult', toolName: 'bash', details: { runId: 'foreign' } })];
+  const parentFile = path.join(root, 'parent.jsonl');
+  file(parentFile, header('current'), entries);
+  const ctx = context('current', parentFile, entries);
+  assert.equal(collectUsage(ctx, root).workflows.input, 0);
+  entries.push(msg('trusted', 3, { role: 'toolResult', toolName: 'workflow', details: { runId: 'foreign' } }));
+  assert.equal(collectUsage(ctx, root).workflows.input, 9);
+});
+
 test('unlinked workflow discovery reads a bounded batch per collection', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-usage-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -107,6 +125,30 @@ test('unlinked workflow discovery reads a bounded batch per collection', (t) => 
   const second = collectUsage(ctx, root).workflows.input;
   assert.ok(second > first && second <= 256, `incremental discovery scanned ${second} runs`);
   assert.equal(collectUsage(ctx, root).workflows.input, 300);
+});
+
+test('late run.json is discovered on the next collection without a runs-root mtime change', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-late-run-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const runs = path.join(root, 'ultracode', 'runs');
+  const dir = path.join(runs, 'late');
+  file(path.join(dir, 'agents', '0', 'child.jsonl'), header('child'), [assistant('charged', 1, 7)]);
+  const ctx = context('owner', undefined, []);
+  const fixedTime = new Date('2025-01-01T00:00:00.000Z');
+  fs.utimesSync(runs, fixedTime, fixedTime);
+  const before = fs.statSync(runs).mtimeMs;
+  assert.equal(collectUsage(ctx, root).workflows.input, 0);
+  fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ sessionId: 'owner' }));
+  assert.equal(fs.statSync(runs).mtimeMs, before);
+  assert.equal(collectUsage(ctx, root).workflows.input, 7);
+  assert.equal(collectUsage(ctx, root).workflows.input, 7);
+  const linked = path.join(runs, 'linked-late');
+  file(path.join(linked, 'agents', '0', 'child.jsonl'), header('linked-child'), [assistant('linked-charge', 2, 7)]);
+  const entries = [msg('linked-result', 1, { role: 'toolResult', toolName: 'workflow', details: { runId: 'linked-late' } })];
+  const linkedCtx = context('owner', undefined, entries);
+  assert.equal(collectUsage(linkedCtx, root).workflows.input, 7);
+  fs.writeFileSync(path.join(linked, 'run.json'), JSON.stringify({ sessionId: 'foreign' }));
+  assert.equal(collectUsage(linkedCtx, root).workflows.input, 14, 'linked run resolves directly when metadata appears');
 });
 
 test('metered agent turn does not hide other turns of the same named agent', (t) => {
@@ -226,4 +268,343 @@ test('legacy turns of a reused agent remain unknown; only session-owned windows 
   assert.equal(collectUsage(firstCtx, root).agents.input, 0);
   assert.equal(collectUsage(firstCtx, root).total.input, 5);
   assert.equal(collectUsage(secondCtx, root).agents.input, 7);
+});
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const totals = (n) => ({ input: n, output: n * 2, cacheRead: n * 3, cacheWrite: n * 4, cost: n / 100 });
+
+function rpcHarness(root, loader = jiti) {
+  const events = new Map();
+  const emitted = [];
+  const sessions = new Map();
+  let current;
+  loader('./extensions/ui.ts').default({
+    on: (name, fn) => events.set(name, fn), registerCommand() {}, getThinkingLevel: () => 'off',
+    appendEntry(customType, data) {
+      const entries = sessions.get(current).entries;
+      const entry = { type: 'custom', id: `snapshot-${emitted.length}`, parentId: entries.at(-1)?.id ?? null,
+        timestamp: new Date().toISOString(), customType, data };
+      entries.push(entry);
+      emitted.push({ type: 'entry_appended', entry });
+    },
+  });
+  const addSession = (id, entries = []) => {
+    sessions.set(id, { entries, file: path.join(root, `${id}.jsonl`) });
+    file(sessions.get(id).file, header(id), entries);
+  };
+  const ctx = {
+    mode: 'rpc', cwd: root, model: undefined,
+    sessionManager: {
+      getSessionId: () => current,
+      getSessionFile: () => sessions.get(current).file,
+      getEntries: () => sessions.get(current).entries,
+    },
+    // RPC does not implement TUI footer/indicator calls.
+    ui: { setFooter() { throw Error('no RPC footer'); }, setWorkingIndicator() { throw Error('no RPC indicator'); } },
+  };
+  const dispatch = async (name, event = {}) => events.get(name)(event, ctx);
+  const snapshots = () => emitted.map((e) => {
+    assert.equal(e.type, 'entry_appended');
+    assert.equal(e.entry.type, 'custom');
+    assert.equal(e.entry.customType, 'pi-extended-cost');
+    assert.deepEqual(Object.keys(e.entry).sort(), ['type', 'id', 'parentId', 'timestamp', 'customType', 'data'].sort());
+    assert.equal(typeof e.entry.id, 'string');
+    assert.ok(Number.isFinite(Date.parse(e.entry.timestamp)));
+    assert.deepEqual(Object.keys(e.entry.data).sort(),
+      ['version', 'sessionId', 'parent', 'agents', 'workflows', 'total', 'activeAgents'].sort());
+    assert.equal(e.entry.data.version, 1);
+    assert.equal('content' in e.entry, false);
+    assert.equal('content' in e.entry.data, false);
+    for (const key of ['parent', 'agents', 'workflows', 'total']) {
+      assert.deepEqual(Object.keys(e.entry.data[key]).sort(), ['input', 'output', 'cacheRead', 'cacheWrite', 'cost'].sort());
+      for (const value of Object.values(e.entry.data[key])) assert.ok(typeof value === 'number' && Number.isFinite(value));
+    }
+    return e.entry.data;
+  });
+  return { addSession, dispatch, snapshots, emitted, sessions, select: (id) => { current = id; },
+    getEntries: (id) => sessions.get(id).entries };
+}
+
+test('RPC snapshots reconcile finalized assistant usage once and rekey on session switch', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-usage-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const h = rpcHarness(root);
+  h.addSession('first');
+  h.select('first');
+  await h.dispatch('session_start');
+  assert.equal(h.emitted.length, 0, 'initial event waits until session_start/new_session has returned');
+  await sleep(15);
+  assert.deepEqual(h.snapshots()[0], { version: 1, sessionId: 'first', parent: totals(0),
+    agents: totals(0), workflows: totals(0), total: totals(0), activeAgents: 0 });
+  const pending = { role: 'assistant', timestamp: Date.parse(time(1)), content: [], usage: usage(3) };
+  await h.dispatch('message_end', { message: pending });
+  assert.equal(h.emitted.length, 1, 'message_end coalesces instead of emitting synchronously');
+  await sleep(110);
+  assert.deepEqual(h.snapshots().at(-1).total, totals(3));
+  assert.equal(h.emitted.length, 2);
+  h.sessions.get('first').entries.push(msg('persisted', 1, pending));
+  await h.dispatch('agent_settled');
+  assert.equal(h.emitted.length, 2, 'persisting the pending message must not double count or emit a duplicate');
+  await h.dispatch('agent_settled');
+  assert.equal(h.emitted.length, 2, 'settle deduplicates the unchanged snapshot');
+
+  await h.dispatch('message_end', { message: { role: 'assistant', timestamp: Date.parse(time(2)), usage: usage(99) } });
+  h.addSession('second', [assistant('second-message', 2, 4)]);
+  h.select('second');
+  await h.dispatch('session_start');
+  const beforeInitial = h.emitted.length;
+  await sleep(15);
+  assert.equal(h.emitted.length, beforeInitial + 1);
+  assert.deepEqual(h.snapshots().at(-1).total, totals(4));
+  assert.equal(h.snapshots().at(-1).sessionId, 'second');
+  const count = h.emitted.length;
+  await sleep(260);
+  assert.equal(h.emitted.length, count, 'old session coalesce/reconcile timers must not publish');
+  await h.dispatch('session_shutdown');
+});
+
+test('RPC same-millisecond finalized messages are reconciled with multiplicity', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-messages-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const h = rpcHarness(root);
+  h.addSession('owner');
+  h.select('owner');
+  await h.dispatch('session_start');
+  await sleep(15);
+  const timestamp = Date.parse(time(1));
+  for (const n of [2, 3]) await h.dispatch('message_end', { message: { role: 'assistant', timestamp, usage: usage(n) } });
+  await sleep(110);
+  assert.equal(h.snapshots().at(-1).parent.input, 5);
+  h.sessions.get('owner').entries.push(msg('persisted', 1, { role: 'assistant', timestamp, content: [], usage: usage(2) }));
+  await h.dispatch('agent_settled');
+  assert.equal(h.snapshots().at(-1).parent.input, 5);
+  h.sessions.get('owner').entries.push(msg('persisted-too', 1, { role: 'assistant', timestamp, content: [], usage: usage(3) }));
+  await h.dispatch('agent_settled');
+  assert.equal(h.snapshots().at(-1).parent.input, 5);
+  await h.dispatch('session_shutdown');
+});
+
+test('RPC child results refresh unchanged parent entries, count owned active agents and settle immediately', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-usage-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const h = rpcHarness(root);
+  const entries = [call('spawn', 1, 'spawn_agent', { name: 'alpha' }), assistant('parent', 2, 2)];
+  h.addSession('owner', entries);
+  h.select('owner');
+  const registry = path.join(root, 'pi-extended-agents.json');
+  const putRegistry = (status, endedAt) => fs.writeFileSync(registry, JSON.stringify({ agents: {
+    alpha: { status, accounting: [{ sessionId: 'owner', startedAt: time(1), endedAt }] },
+    unrelated: { status: 'running', accounting: [{ sessionId: 'elsewhere', startedAt: time(1) }] },
+  } }));
+  putRegistry('running');
+  await h.dispatch('session_start');
+  await sleep(15);
+  assert.equal(h.snapshots().at(-1).activeAgents, 1);
+  assert.deepEqual(h.snapshots().at(-1).total, totals(2));
+  const child = path.join(root, 'pi-extended-agent-sessions', 'alpha', 'child.jsonl');
+  file(child, header('child'), [assistant('child-one', 3, 5)]);
+  await h.dispatch('tool_result', { toolName: 'spawn_agent' });
+  assert.equal(h.snapshots().length, 1);
+  await sleep(110);
+  assert.deepEqual(h.snapshots().at(-1).agents, totals(5));
+  assert.deepEqual(h.snapshots().at(-1).total, totals(7));
+  assert.equal(h.sessions.get('owner').entries.filter((e) => e.type === 'message').length, 2);
+
+  file(child, header('child'), [assistant('child-one', 3, 5), assistant('child-two', 4, 7)]);
+  putRegistry('done', time(5));
+  await h.dispatch('agent_settled');
+  assert.deepEqual({ ...h.snapshots().at(-1).agents, cost: Number(h.snapshots().at(-1).agents.cost.toFixed(8)) }, totals(12));
+  assert.deepEqual({ ...h.snapshots().at(-1).total, cost: Number(h.snapshots().at(-1).total.cost.toFixed(8)) }, totals(14));
+  assert.equal(h.snapshots().at(-1).activeAgents, 0);
+  const count = h.emitted.length;
+  await h.dispatch('tool_result', { toolName: 'wait_agent' });
+  await h.dispatch('session_shutdown');
+  await sleep(120);
+  assert.equal(h.emitted.length, count, 'shutdown cancels queued child snapshot');
+});
+
+test('RPC initial snapshot is live after session start, recoverable from entries, and canceled on replacement', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-initial-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const h = rpcHarness(root);
+  h.addSession('first', [assistant('already-billed', 1, 3)]);
+  h.select('first');
+  await h.dispatch('session_start');
+  // Delay is best effort, not a promise about response/event ordering.
+  assert.equal(h.emitted.length, 0);
+  await sleep(15);
+  assert.deepEqual(h.snapshots()[0].total, totals(3));
+  const catchup = h.getEntries('first').filter((e) => e.type === 'custom' && e.customType === 'pi-extended-cost');
+  assert.equal(catchup.length, 1, 'late subscribers can recover the missed live event via get_entries');
+  assert.deepEqual(catchup[0], h.emitted[0].entry);
+  h.addSession('abandoned');
+  h.select('abandoned');
+  await h.dispatch('session_start');
+  h.addSession('replacement');
+  h.select('replacement');
+  await h.dispatch('session_start');
+  await sleep(15);
+  assert.equal(h.getEntries('abandoned').length, 0, 'superseded initial timer never appends');
+  assert.deepEqual(h.snapshots().at(-1).total, totals(0));
+  assert.equal(h.snapshots().at(-1).sessionId, 'replacement');
+  await h.dispatch('session_shutdown');
+});
+
+test('RPC running children cause no idle IO; only lifecycle events refresh charges', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-event-only-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  const originalRead = fsMutable.readFileSync;
+  let reads = 0;
+  fsMutable.readFileSync = function (filename, ...args) {
+    if (typeof filename === 'string' && filename.startsWith(root)) reads++;
+    return originalRead.call(this, filename, ...args);
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    fsMutable.readFileSync = originalRead;
+    syncBuiltinESMExports();
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const dir = path.join(root, 'ultracode', 'runs', 'active-run');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ sessionId: 'owner', status: 'running' }));
+  const child = path.join(dir, 'agents', '0', 'child.jsonl');
+  file(child, header('child'), [assistant('one', 2, 2)]);
+  const entries = [call('spawn', 1, 'spawn_agent', { name: 'alpha' }),
+    msg('active', 1, { role: 'toolResult', toolName: 'workflow', details: { runId: 'active-run' } })];
+  fs.writeFileSync(path.join(root, 'pi-extended-agents.json'), JSON.stringify({ agents: {
+    alpha: { status: 'running', accounting: [{ sessionId: 'owner', startedAt: time(1) }] },
+  } }));
+  const h = rpcHarness(root, createJiti(import.meta.url, { moduleCache: false }));
+  h.addSession('owner', entries);
+  h.select('owner');
+  await h.dispatch('session_start');
+  assert.equal(reads, 0, 'session_start does not inspect historical workflow run status');
+  await sleep(150); // initial snapshot and any bounded discovery retries finish
+  assert.equal(h.snapshots().at(-1).workflows.input, 2);
+  assert.equal(h.snapshots().at(-1).activeAgents, 1);
+  const idleReads = reads;
+  const idleCount = h.emitted.length;
+  file(child, header('child'), [assistant('one', 2, 2), assistant('two', 3, 3)]);
+  await sleep(2200); // beyond the former two-second child poll
+  assert.equal(reads, idleReads, 'no running-child or workflow reads without an event');
+  assert.equal(h.emitted.length, idleCount);
+  await h.dispatch('tool_result', { toolName: 'workflow' });
+  await sleep(110);
+  assert.equal(h.snapshots().at(-1).workflows.input, 5);
+  await h.dispatch('session_shutdown');
+});
+
+test('RPC historical discovery is event-bounded, not drained by a 25ms timer', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-history-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  const runs = path.join(root, 'ultracode', 'runs');
+  for (let i = 0; i < 300; i++) {
+    const dir = path.join(runs, `run-${i}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ sessionId: 'owner' }));
+    file(path.join(dir, 'agents', '0', 'child.jsonl'), header(`child-${i}`), [assistant(`entry-${i}`, 1, 1)]);
+  }
+  const originalRead = fsMutable.readFileSync;
+  let metadataReads = 0;
+  fsMutable.readFileSync = function (filename, ...args) {
+    if (typeof filename === 'string' && filename.startsWith(runs) && filename.endsWith('run.json')) metadataReads++;
+    return originalRead.call(this, filename, ...args);
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    fsMutable.readFileSync = originalRead;
+    syncBuiltinESMExports();
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const h = rpcHarness(root, createJiti(import.meta.url, { moduleCache: false }));
+  h.addSession('owner');
+  h.select('owner');
+  await h.dispatch('session_start');
+  await sleep(40);
+  assert.ok(metadataReads > 0 && metadataReads <= 128, `startup opened ${metadataReads} run.json files`);
+  const first = h.snapshots().at(-1).workflows.input;
+  assert.ok(first > 0 && first <= 128);
+  const idleReads = metadataReads;
+  const idleSnapshots = h.emitted.length;
+  await sleep(220);
+  assert.equal(metadataReads, idleReads, 'idle time does not drain historical run.json files');
+  assert.equal(h.emitted.length, idleSnapshots);
+  await h.dispatch('agent_settled');
+  assert.ok(metadataReads > idleReads && metadataReads <= idleReads + 128);
+  assert.ok(h.snapshots().at(-1).workflows.input > first);
+  await h.dispatch('session_shutdown');
+});
+
+test('RPC workflow completion and metered tool result reconcile without child double billing', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-rpc-workflow-'));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const h = rpcHarness(root);
+  const entries = [msg('workflow-result', 1, { role: 'toolResult', toolName: 'workflow',
+    details: { runId: 'rpc-run', background: true } })];
+  const dir = path.join(root, 'ultracode', 'runs', 'rpc-run');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ sessionId: 'owner', status: 'running' }));
+  const child = path.join(dir, 'agents', '0', 'child.jsonl');
+  file(child, header('child'), [assistant('first', 2, 2)]);
+  h.addSession('owner', entries);
+  h.select('owner');
+  await h.dispatch('session_start');
+  await sleep(15);
+  assert.equal(h.snapshots().at(-1).workflows.input, 2);
+  file(child, header('child'), [assistant('first', 2, 2), assistant('second', 3, 3)]);
+  fs.writeFileSync(path.join(dir, 'run.json'), JSON.stringify({ sessionId: 'owner', status: 'done' }));
+  await h.dispatch('tool_result', { toolName: 'workflow' });
+  await sleep(110);
+  assert.equal(h.snapshots().at(-1).workflows.input, 5);
+  assert.equal(h.snapshots().at(-1).total.input, 5);
+
+  const metered = msg('metered', 4, { role: 'toolResult', toolName: 'workflow',
+    details: { runId: 'rpc-run' }, usage: usage(5) });
+  await h.dispatch('message_end', { message: metered.message }); // before persistence: do not overlay child + tool
+  entries.push(metered);
+  entries.push({ type: 'compaction', id: 'compact', timestamp: time(5), usage: usage(2) });
+  await h.dispatch('agent_settled');
+  assert.equal(h.snapshots().at(-1).parent.input, 7);
+  assert.equal(h.snapshots().at(-1).workflows.input, 0);
+  assert.equal(h.snapshots().at(-1).total.input, 7);
+  await sleep(230);
+  assert.equal(h.snapshots().at(-1).total.input, 7, 'no delayed duplicate after settlement');
+  await h.dispatch('session_shutdown');
 });

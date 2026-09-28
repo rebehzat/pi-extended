@@ -55,6 +55,50 @@ as an explicit override for CI and one-off runs.
 - Model change notifications
 - Widgets: active goals (from `goals.ts`)
 
+## Piano cost snapshot (RPC integration)
+
+Pi 0.87.1 RPC `setStatus` carries text only, not structured status data. In RPC mode,
+pi-extended publishes a structured cost snapshot with
+`pi.appendEntry('pi-extended-cost', data)`. Piano should filter RPC `entry_appended`
+events for entries whose `customType` is `pi-extended-cost` and read their `data`:
+
+```json
+{"type":"entry_appended","entry":{"type":"custom","id":"<Pi entry id>","parentId":"<Pi entry id>","timestamp":"<ISO time>","customType":"pi-extended-cost","data":{"version":1,"sessionId":"<Pi session id>","parent":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":0},"agents":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":0},"workflows":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":0},"total":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":0},"activeAgents":0}}}
+```
+
+Pi supplies the outer entry fields; this is an application-level schema, not a built-in
+Pi cost event. The snapshot contains only aggregate billing data:
+
+| Field | Meaning |
+|-------|---------|
+| `version` | Protocol version, currently `1`. |
+| `sessionId` | Parent Pi session ID for matching/rekeying the displayed session. |
+| `parent`, `agents`, `workflows`, `total` | Each has numeric `input`, `output`, `cacheRead`, `cacheWrite` token counts and `cost` in USD. |
+| `activeAgents` | Integer count of active subagents. |
+
+Use `get_state` to identify the current session ID; when the session changes (including
+`/new`, `/resume`, or a fork), rekey the displayed snapshot rather than carrying the old
+session's totals forward. Subscribe to `entry_appended` before requesting a session
+switch, then call `get_entries` after it and on initial connection or reconnect. Select
+the latest matching `pi-extended-cost` entry for the current session; merge the live and
+catch-up streams and deduplicate by Pi entry `id` and schema `version`. Use `get_entries`'s
+`since` cursor for later catch-up. The initial timer is best effort: there is **no**
+guarantee the append arrives after the `new_session` response. If no snapshot exists yet,
+wait for the next one (and verify that this extension is loaded). Snapshots contain no
+transcript or private fields.
+
+Snapshots refresh on session start, finalized assistant messages, relevant tool results,
+agent settlement, compaction and tree navigation. Updates are deduplicated/coalesced;
+there are no per-stream writes or continuous child/workflow polls. Child and workflow
+charges may only update at completion or another lifecycle event; live intra-run charges
+are not guaranteed. RPC scans at most 128 run-directory/metadata candidates per collection;
+explicit workflow-result run IDs (and resume ancestors) are resolved directly. Historical
+unlinked runs beyond that batch are discovered on later lifecycle events, not guaranteed
+in the startup snapshot. Missing `run.json` metadata is retried on later collections even
+if the runs directory's mtime has not changed. RPC performs no idle discovery polling.
+Custom entries are stored in session history but are non-context (they are not sent
+to the model); consumers should account for the session-history storage overhead.
+
 ## Environment & optional dependencies
 
 | Thing | Needed for | Fallback without it |

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { collectUsage, hasPendingRunScan } from "./usage.ts";
+import { addUsage, collectUsage, hasPendingRunScan, type Totals } from "./usage.ts";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const RAINBOW = [
@@ -73,6 +73,17 @@ function runningAgents(): number {
   }
 }
 
+// The agent registry is global; only session-owned running windows belong in a session snapshot.
+function runningSessionAgents(sessionId: string): number {
+  try {
+    const registry = JSON.parse(fs.readFileSync(path.join(getAgentDir(), "pi-extended-agents.json"), "utf8")) as {
+      agents?: Record<string, { status?: string; accounting?: Array<{ sessionId: string; endedAt?: string }> }>;
+    };
+    return Object.values(registry.agents ?? {}).filter((a) => a.status === "running" &&
+      a.accounting?.some((r) => r.sessionId === sessionId && !r.endedAt)).length;
+  } catch { return 0; }
+}
+
 function activeGoals(ctx: ExtensionContext): number {
   try {
     let latest: { goals?: Array<{ status?: string }> } | undefined;
@@ -98,6 +109,83 @@ export default function (pi: ExtensionAPI) {
   let cachedEntries = 0;
   let statsDirty = true;
   let agentsWereRunning = false;
+
+  // RPC has no structured setStatus payload. appendEntry publishes entry_appended on
+  // the documented RPC session-event stream; never write snapshots to model context.
+  const SNAPSHOT_TYPE = "pi-extended-cost";
+  const COALESCE_MS = 75;
+  let snapshotSession = "";
+  let snapshotGeneration = 0;
+  let lastSnapshot = "";
+  let initialTimer: ReturnType<typeof setTimeout> | undefined;
+  let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+  const pendingMessages: Array<{ timestamp: number; usage: unknown }> = [];
+  const clearSnapshotTimers = () => {
+    for (const timer of [initialTimer, snapshotTimer]) if (timer) clearTimeout(timer);
+    initialTimer = snapshotTimer = undefined;
+  };
+
+  const messageKey = (m: { timestamp?: number; usage?: unknown }) =>
+    `${m.timestamp}:${JSON.stringify(m.usage)}`;
+
+  const publishSnapshot = (ctx: ExtensionContext, force = false) => {
+    if (ctx.mode !== "rpc" || ctx.sessionManager.getSessionId() !== snapshotSession) return;
+    // collectUsage indexes run metadata in bounded batches; never run it per stream token.
+    const totals = collectUsage(ctx);
+    if (pendingMessages.length) {
+      const persisted = new Map<string, number>();
+      for (const e of ctx.sessionManager.getEntries()) {
+        if (e.type !== "message" || e.message?.role !== "assistant") continue;
+        const key = messageKey(e.message);
+        persisted.set(key, (persisted.get(key) ?? 0) + 1);
+      }
+      // A timestamp is not a unique message ID. Reconcile matching usage with
+      // multiplicity, including two finalized messages in the same millisecond.
+      for (let i = pendingMessages.length - 1; i >= 0; i--) {
+        const message = pendingMessages[i];
+        const key = messageKey(message);
+        const count = persisted.get(key) ?? 0;
+        if (count > 0) {
+          persisted.set(key, count - 1);
+          pendingMessages.splice(i, 1);
+        } else {
+          // Metered tool results are reconciled from entries for child suppression.
+          addUsage(totals.parent, message.usage);
+          addUsage(totals.total, message.usage);
+        }
+      }
+    }
+    const data = {
+      version: 1,
+      sessionId: snapshotSession,
+      parent: totals.parent as Totals,
+      agents: totals.agents as Totals,
+      workflows: totals.workflows as Totals,
+      total: totals.total as Totals,
+      activeAgents: runningSessionAgents(snapshotSession),
+    };
+    const serialized = JSON.stringify(data);
+    if (force || serialized !== lastSnapshot) {
+      pi.appendEntry(SNAPSHOT_TYPE, data);
+      lastSnapshot = serialized;
+    }
+  };
+
+  const queueSnapshot = (ctx: ExtensionContext) => {
+    if (ctx.mode !== "rpc" || ctx.sessionManager.getSessionId() !== snapshotSession || snapshotTimer) return;
+    const generation = snapshotGeneration;
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = undefined;
+      if (generation === snapshotGeneration) publishSnapshot(ctx);
+    }, COALESCE_MS);
+    snapshotTimer.unref?.();
+  };
+
+  const settleSnapshot = (ctx: ExtensionContext) => {
+    if (snapshotTimer) clearTimeout(snapshotTimer);
+    snapshotTimer = undefined;
+    publishSnapshot(ctx);
+  };
 
   const computeSessionStats = (ctx: ExtensionContext) => {
     const t = { ...collectUsage(ctx).total, cacheHit: undefined as number | undefined, started: undefined as number | undefined };
@@ -230,6 +318,20 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    clearSnapshotTimers();
+    pendingMessages.length = 0;
+    snapshotSession = ctx.sessionManager.getSessionId();
+    snapshotGeneration++;
+    lastSnapshot = "";
+    if (ctx.mode === "rpc") {
+      // Best-effort delayed live notification; catch up with get_entries after a switch.
+      const generation = snapshotGeneration;
+      initialTimer = setTimeout(() => {
+        initialTimer = undefined;
+        if (generation === snapshotGeneration) publishSnapshot(ctx, true);
+      }, 0);
+      initialTimer.unref?.();
+    }
     turnCount = 0;
     statsDirty = true;
     ctxRef = ctx;
@@ -279,7 +381,35 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("message_end", async (event, ctx) => {
+    const message = event.message;
+    if (ctx.mode !== "rpc" || ctx.sessionManager.getSessionId() !== snapshotSession) return;
+    if (message.role === "assistant" && message.usage) {
+      if (typeof message.timestamp === "number") pendingMessages.push({ timestamp: message.timestamp, usage: message.usage });
+      queueSnapshot(ctx);
+    } else if (message.role === "toolResult") {
+      if (message.usage || message.toolName === "workflow") queueSnapshot(ctx);
+    }
+  });
+
+  // Child agent/workflow tools may settle without changing the parent's entry count.
+  pi.on("tool_result", async (event, ctx) => {
+    if (ctx.mode !== "rpc" || ctx.sessionManager.getSessionId() !== snapshotSession) return;
+    if (["spawn_agent", "send_message", "followup_task", "wait_agent", "workflow"].includes(event.toolName)) queueSnapshot(ctx);
+  });
+  pi.on("session_compact", async (_event, ctx) => queueSnapshot(ctx));
+  // Tree navigation stays in the same session and retains inactive-branch entries.
+  pi.on("session_tree", async (_event, ctx) => queueSnapshot(ctx));
+
+  pi.on("session_shutdown", async () => {
+    clearSnapshotTimers();
+    pendingMessages.length = 0;
+    snapshotSession = "";
+    snapshotGeneration++;
+  });
+
   pi.on("agent_settled", async (_event, ctx) => {
+    if (ctx.mode === "rpc") settleSnapshot(ctx);
     try {
       ctx.ui.setWorkingIndicator(undefined);
     } catch {

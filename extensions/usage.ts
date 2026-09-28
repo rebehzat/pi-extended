@@ -97,7 +97,7 @@ function countFiles(files: string[], include: (entry: any, file: string) => bool
 // Index run metadata incrementally. A render never opens every run.json in a large history.
 // Explicitly linked runs (and their resume ancestors) are resolved directly below.
 const RUN_SCAN_BATCH = 128;
-const runIndexes = new Map<string, { dir: fs.Dir | undefined; runs: Map<string, any>; mtime: number }>();
+const runIndexes = new Map<string, { dir: fs.Dir | undefined; runs: Map<string, any>; pending: Set<string>; revisit: boolean; mtime: number }>();
 export function hasPendingRunScan(agentDir = getAgentDir()): boolean {
   return Boolean(runIndexes.get(path.join(agentDir, "ultracode", "runs"))?.dir);
 }
@@ -107,14 +107,34 @@ function indexedRuns(root: string): Map<string, any> {
   let index = runIndexes.get(root);
   if (!index || index.mtime !== mtime) {
     index?.dir?.closeSync();
-    index = { dir: fs.opendirSync(root), runs: new Map(), mtime };
+    index = { dir: fs.opendirSync(root), runs: new Map(), pending: new Set(), revisit: false, mtime };
     runIndexes.set(root, index);
+  } else if (!index.dir && index.revisit) {
+    // More than one batch of directories lacked metadata: revisit them on later events.
+    index.dir = fs.opendirSync(root);
+    index.revisit = false;
   }
-  for (let i = 0; i < RUN_SCAN_BATCH && index.dir; i++) {
+  const readRun = (name: string) => {
+    try {
+      index.runs.set(name, JSON.parse(fs.readFileSync(path.join(root, name, "run.json"), "utf8")));
+      index.pending.delete(name);
+    } catch {
+      if (index.pending.size < RUN_SCAN_BATCH || index.pending.has(name)) index.pending.add(name);
+      else index.revisit = true;
+    }
+  };
+  // Reserve part of each batch for new directories so missing metadata cannot starve discovery.
+  const retryLimit = index.dir ? RUN_SCAN_BATCH / 2 : RUN_SCAN_BATCH;
+  let retries = 0;
+  for (const name of index.pending) {
+    if (retries++ >= retryLimit) break;
+    readRun(name);
+  }
+  for (let i = retries; i < RUN_SCAN_BATCH && index.dir; i++) {
     const entry = index.dir.readSync();
     if (!entry) { index.dir.closeSync(); index.dir = undefined; break; }
     if (!entry.isDirectory() || !/^[\w-]+$/.test(entry.name)) continue;
-    try { index.runs.set(entry.name, JSON.parse(fs.readFileSync(path.join(root, entry.name, "run.json"), "utf8"))); } catch {}
+    readRun(entry.name);
   }
   return index.runs;
 }
@@ -164,9 +184,13 @@ export function collectUsage(ctx: { sessionManager: { getEntries(): any[]; getSe
       }
     } else if (m?.role === "toolResult") {
       const details = m.details;
-      if (typeof details?.runId === "string") runIds.add(details.runId);
+      // Only workflow results may link a run. An unrelated tool's arbitrary details
+      // must not import another session's charges (or suppress a real linked run).
+      const workflowRunId = m.toolName === "workflow" && typeof details?.runId === "string" &&
+        /^[\w-]+$/.test(details.runId) ? details.runId as string : undefined;
+      if (workflowRunId) runIds.add(workflowRunId);
       if (m.usage) {
-        if (m.toolName === "workflow" && typeof details?.runId === "string") representedRuns.add(details.runId);
+        if (workflowRunId) representedRuns.add(workflowRunId);
         if (["spawn_agent", "send_message", "followup_task"].includes(m.toolName)) {
           if (typeof details?.name === "string") representedAgents.add(details.name);
           if (typeof m.toolCallId === "string") meteredAgentCalls.add(m.toolCallId);

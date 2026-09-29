@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createAgentProgress, type ProgressTask } from "./agent-progress.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { expandHome, nowIso, readJson, serializeError, tmpDirFor, truncate, writeJsonAtomic } from "./lib.ts";
 
@@ -35,6 +36,7 @@ interface AgentState {
 interface RunningTurn {
   proc: ChildProcess;
   record: AgentRecord;
+  cancelled: boolean;
 }
 
 type UpdateFn = (partial: AgentToolResult<unknown>) => void;
@@ -43,6 +45,9 @@ const MAX_WAIT_MS = 60 * 60 * 1000;
 const OUTPUT_CAP = 24 * 1024;
 
 let running = new Map<string, RunningTurn>();
+// Persisting the attribution window precedes spawn; do not mistake that short
+// in-process startup interval for a process restart.
+const starting = new Map<string, AgentRecord>();
 
 function stateFile(): string {
   return path.join(getAgentDir(), "pi-extended-agents.json");
@@ -57,7 +62,7 @@ function loadState(): AgentState {
   let recovered = false;
   const closedAt = nowIso();
   for (const rec of Object.values(state.agents)) {
-    if (rec.status === "running" && !running.has(rec.name)) {
+    if (rec.status === "running" && !running.has(rec.name) && !starting.has(rec.name)) {
       rec.status = "error";
       rec.lastOutput = rec.lastOutput ?? "(pi restarted while agent was running; turn lost)";
       // A crash cannot leave the previous parent's billing window open for a later turn.
@@ -76,8 +81,14 @@ function loadState(): AgentState {
   return state;
 }
 
+let pendingSave: Promise<void> = Promise.resolve();
 async function saveState(state: AgentState): Promise<void> {
-  await writeJsonAtomic(stateFile(), state);
+  // Concurrent background turns and queued tool calls must not race on the same
+  // atomic-write temporary file or overwrite a newer registry snapshot.
+  const snapshot = structuredClone(state);
+  const next = pendingSave.then(() => writeJsonAtomic(stateFile(), snapshot));
+  pendingSave = next.catch(() => {});
+  await next;
 }
 
 async function persist(record: AgentRecord): Promise<void> {
@@ -109,6 +120,7 @@ interface TurnResult {
   stderr: string;
   usage: { turns: number; input: number; output: number; cost: number };
   stopReason?: string;
+  cancelled?: boolean;
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -129,6 +141,7 @@ async function runTurn(
   isContinue: boolean,
   signal?: AbortSignal,
   onUpdate?: UpdateFn,
+  onUsage?: (usage: unknown) => void,
 ): Promise<TurnResult> {
   const args: string[] = ["--mode", "json", "-p", "--session-dir", record.sessionDir];
   if (isContinue) args.push("--continue");
@@ -169,7 +182,8 @@ async function runTurn(
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      running.set(record.name, { proc, record });
+      const live: RunningTurn = { proc, record, cancelled: false };
+      running.set(record.name, live);
       record.status = "running";
 
       let buffer = "";
@@ -188,6 +202,7 @@ async function runTurn(
             result.usage.turns++;
             const usage = (msg as { usage?: { input?: number; output?: number; cost?: { total?: number } } }).usage;
             if (usage) {
+              onUsage?.(usage);
               result.usage.input += usage.input ?? 0;
               result.usage.output += usage.output ?? 0;
               result.usage.cost += usage.cost?.total ?? 0;
@@ -216,6 +231,7 @@ async function runTurn(
       });
       proc.on("close", (code) => {
         if (buffer.trim()) processLine(buffer);
+        result.cancelled = live.cancelled;
         running.delete(record.name);
         resolve(code ?? 0);
       });
@@ -227,6 +243,7 @@ async function runTurn(
 
       if (signal) {
         const kill = () => {
+          live.cancelled = true;
           proc.kill("SIGTERM");
           setTimeout(() => {
             if (proc.exitCode === null) proc.kill("SIGKILL");
@@ -267,6 +284,8 @@ function formatRecord(rec: AgentRecord): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  const progress = createAgentProgress(pi);
+  const queuedProgress = new WeakMap<object, { task: ProgressTask; ctx: ExtensionContext }>();
   const applyTurnResult = (record: AgentRecord, turn: TurnResult): void => {
     record.lastOutput = turn.output;
     record.lastExitCode = turn.exitCode;
@@ -278,14 +297,19 @@ export default function (pi: ExtensionAPI) {
     record.status = isTurnOk(turn) ? "idle" : "error";
   };
 
-  const accountedTurn = async (record: AgentRecord, task: string, isContinue: boolean, sessionId?: string, toolCallId?: string, signal?: AbortSignal, onUpdate?: UpdateFn): Promise<TurnResult> => {
+  const accountedTurn = async (record: AgentRecord, task: string, isContinue: boolean, sessionId?: string, toolCallId?: string, signal?: AbortSignal, onUpdate?: UpdateFn, progressTask?: ProgressTask, ctx?: ExtensionContext): Promise<TurnResult> => {
     const window = sessionId ? { sessionId, toolCallId, startedAt: nowIso(), endedAt: undefined as string | undefined } : undefined;
-    if (window) {
-      (record.accounting ??= []).push(window);
-      await persist(record);
-    }
-    try { return await runTurn(record, task, isContinue, signal, onUpdate); }
-    finally {
+    starting.set(record.name, record);
+    try {
+      if (window) {
+        (record.accounting ??= []).push(window);
+        await persist(record);
+      }
+      return await runTurn(record, task, isContinue, signal, onUpdate, (usage) => {
+        if (ctx) progress.usage(progressTask, ctx, usage);
+      });
+    } finally {
+      if (starting.get(record.name) === record) starting.delete(record.name);
       if (window) {
         window.endedAt = nowIso();
         await persist(record);
@@ -297,8 +321,16 @@ export default function (pi: ExtensionAPI) {
     while (record.queue.length > 0 && !running.has(record.name)) {
       const next = record.queue.shift()!;
       record.turnCount++;
-      const turn = await accountedTurn(record, typeof next === "string" ? next : next.task, true, typeof next === "string" ? undefined : next.sessionId, typeof next === "string" ? undefined : next.toolCallId, signal);
-      applyTurnResult(record, turn);
+      const tracked = typeof next === "string" ? undefined : queuedProgress.get(next);
+      if (tracked) progress.running(tracked.task, tracked.ctx);
+      try {
+        const turn = await accountedTurn(record, typeof next === "string" ? next : next.task, true, typeof next === "string" ? undefined : next.sessionId, typeof next === "string" ? undefined : next.toolCallId, signal, undefined, tracked?.task, tracked?.ctx);
+        applyTurnResult(record, turn);
+        if (tracked) progress.finish(tracked.task, tracked.ctx, turn.cancelled ? "cancelled" : isTurnOk(turn) ? "completed" : "failed");
+      } catch (err) {
+        if (tracked) progress.finish(tracked.task, tracked.ctx, "failed");
+        throw err;
+      }
     }
     await persist(record);
   };
@@ -311,11 +343,19 @@ export default function (pi: ExtensionAPI) {
     isContinue: boolean,
     signal?: AbortSignal,
     onUpdate?: UpdateFn,
+    progressTask?: ProgressTask,
+    ctx?: ExtensionContext,
   ): Promise<void> => {
     record.turnCount = isContinue ? record.turnCount + 1 : 1;
-    const turn = await accountedTurn(record, prompt, isContinue, sessionId, toolCallId, signal, onUpdate);
-    applyTurnResult(record, turn);
-    await kickQueue(record, signal);
+    try {
+      const turn = await accountedTurn(record, prompt, isContinue, sessionId, toolCallId, signal, onUpdate, progressTask, ctx);
+      applyTurnResult(record, turn);
+      if (ctx) progress.finish(progressTask, ctx, turn.cancelled ? "cancelled" : isTurnOk(turn) ? "completed" : "failed");
+      await kickQueue(record, signal);
+    } catch (err) {
+      if (ctx) progress.finish(progressTask, ctx, "failed");
+      throw err;
+    }
   };
 
   pi.registerTool({
@@ -378,7 +418,8 @@ export default function (pi: ExtensionAPI) {
       state.agents[name] = record;
       await saveState(state);
 
-      void startAgent(record, params.task, ctx.sessionManager.getSessionId(), toolCallId, Boolean(existing), signal, onUpdate).catch((err) => {
+      const progressTask = progress.begin(ctx);
+      void startAgent(record, params.task, ctx.sessionManager.getSessionId(), toolCallId, Boolean(existing), signal, onUpdate, progressTask, ctx).catch((err) => {
         record.status = "error";
         record.lastOutput = serializeError(err);
         record.lastActivity = nowIso();
@@ -415,8 +456,12 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Unknown agent "${params.agent}". Known: ${available}.`);
       }
       if (running.has(record.name) || record.status === "running") {
-        record.queue.push({ task: params.message, sessionId: ctx.sessionManager.getSessionId(), toolCallId });
-        await persist(record);
+        const next = { task: params.message, sessionId: ctx.sessionManager.getSessionId(), toolCallId };
+        const target = running.get(record.name)?.record ?? starting.get(record.name) ?? record;
+        target.queue.push(next);
+        await persist(target);
+        const task = progress.begin(ctx, "pending");
+        if (task) queuedProgress.set(next, { task, ctx });
         return {
           content: [
             {
@@ -428,8 +473,16 @@ export default function (pi: ExtensionAPI) {
         };
       }
       record.turnCount++;
-      const turn = await accountedTurn(record, params.message, true, ctx.sessionManager.getSessionId(), toolCallId, signal, onUpdate);
-      applyTurnResult(record, turn);
+      const task = progress.begin(ctx);
+      let turn: TurnResult;
+      try {
+        turn = await accountedTurn(record, params.message, true, ctx.sessionManager.getSessionId(), toolCallId, signal, onUpdate, task, ctx);
+        applyTurnResult(record, turn);
+        progress.finish(task, ctx, turn.cancelled ? "cancelled" : isTurnOk(turn) ? "completed" : "failed");
+      } catch (err) {
+        progress.finish(task, ctx, "failed");
+        throw err;
+      }
       void kickQueue(record, signal).catch(() => {});
       await persist(record);
       return {
@@ -456,10 +509,14 @@ export default function (pi: ExtensionAPI) {
         const available = Object.keys(state.agents).join(", ") || "none";
         throw new Error(`Unknown agent "${params.agent}". Known: ${available}.`);
       }
-      record.queue.push({ task: params.task, sessionId: ctx.sessionManager.getSessionId(), toolCallId });
-      await persist(record);
+      const next = { task: params.task, sessionId: ctx.sessionManager.getSessionId(), toolCallId };
+      const target = running.get(record.name)?.record ?? starting.get(record.name) ?? record;
+      target.queue.push(next);
+      await persist(target);
+      const task = progress.begin(ctx, "pending");
+      if (task) queuedProgress.set(next, { task, ctx });
       if (!running.has(record.name) && record.status !== "running") {
-        void kickQueue(record).catch(() => {});
+        void kickQueue(target).catch(() => {});
         return {
           content: [
             { type: "text", text: `Agent "${record.name}" was idle; follow-up task started now. Check with wait_agent(agent="${record.name}").` },
@@ -514,7 +571,10 @@ export default function (pi: ExtensionAPI) {
       const timeoutMs = Math.min(Math.max(1, (params.timeout_s ?? 300) * 1000), MAX_WAIT_MS);
       const deadline = Date.now() + timeoutMs;
 
-      const stillRunning = () => names.filter((n) => running.has(n) || state.agents[n]?.status === "running");
+      const stillRunning = () => {
+        const current = loadState();
+        return names.filter((n) => running.has(n) || starting.has(n) || current.agents[n]?.status === "running");
+      };
 
       let pending = stillRunning();
       while (pending.length > 0 && Date.now() < deadline && !signal?.aborted) {
@@ -559,6 +619,7 @@ export default function (pi: ExtensionAPI) {
           details: { name: record.name, killed: false },
         };
       }
+      turn.cancelled = true;
       turn.proc.kill("SIGTERM");
       setTimeout(() => {
         if (turn.proc.exitCode === null) turn.proc.kill("SIGKILL");
@@ -581,12 +642,14 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
+    progress.sessionStart(ctx);
     const state = loadState();
     await saveState(state);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    progress.shutdown(ctx);
     for (const [, turn] of running) {
       try {
         turn.proc.kill("SIGTERM");

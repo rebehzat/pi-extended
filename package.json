@@ -11,8 +11,13 @@
     "extensions": [
       "extensions/*.ts",
       "!extensions/lib.ts",
-      "!extensions/usage.ts"
+      "!extensions/usage.ts",
+      "!extensions/agent-progress.ts"
     ]
+  },
+  "scripts": {
+    "test": "node --test usage-test.mjs agent-progress-test.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

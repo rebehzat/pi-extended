@@ -99,6 +99,26 @@ if the runs directory's mtime has not changed. RPC performs no idle discovery po
 Custom entries are stored in session history but are non-context (they are not sent
 to the model); consumers should account for the session-history storage overhead.
 
+## Piano task progress (RPC integration)
+
+`spawn_agent` and subsequent named-agent turns (`send_message` / `followup_task`)
+append `piano-task-progress` custom entries at start, queued-to-running transitions,
+finalized assistant usage (100ms coalescing, at most 32 intermediate usage entries
+per task), and settlement. A task has a random opaque
+`taskId`, `kind: "spawned_agent"`, `version: 1`, the initiating Pi `sessionId`, a generic
+`title` (`Agent #N`), lifecycle timestamps, a `status` (`pending`, `running`,
+`completed`, `failed`, `cancelled`, or `interrupted`), and cumulative nonnegative
+`usage` (`totalTokens`, `inputTokens`, `cachedInputTokens`, `outputTokens`, `costUsd`).
+There is no `runId` for standalone agents. No name, prompt, child text/error, path, or PID
+is copied to these entries. The existing `pi-extended-cost` producer is independent.
+
+Consumers should filter `entry_appended` / `get_entries` by `customType`, validate the
+schema, compare `data.sessionId` with the **active** Pi session, and keep the latest
+snapshot by `taskId`. In-flight tasks from a switched-away session never append to the
+new session. Entries are event-driven (no child polling or per-token writes); progress
+between finalized assistant messages is not guaranteed. This extension does not emit
+workflow run/member task entries; those must come from a workflow producer.
+
 ## Environment & optional dependencies
 
 | Thing | Needed for | Fallback without it |
